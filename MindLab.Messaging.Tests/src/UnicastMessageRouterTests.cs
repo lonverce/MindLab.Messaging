@@ -227,5 +227,45 @@ namespace MindLab.Messaging.Tests
 
             Mock.Assert(cb);
         }
+
+        [Test]
+        [TestCase(1, 1)]
+        [TestCase(1, 10)]
+        [TestCase(10, 1)]
+        [TestCase(10, 10)]
+        [TestCase(100, 100)]
+        public async Task PublishMessage_AllQueueReceived(int queueCount, int messageCount)
+        {
+            var queueTask = new Task[queueCount];
+            var router = new UnicastMessageRouter<int>();
+
+            for (int i = 0; i < queueCount; i++)
+            {
+                var mq = new MessageQueue<int>();
+                var binding = await mq.BindAsync($"queue[{i}]", router);
+
+                queueTask[i] = Task.Run(async () =>
+                {
+                    for (int j = 0; j < messageCount; j++)
+                    {
+                        var msg = await mq.TakeMessageAsync();
+                        Assert.AreEqual(j, msg.Payload);
+                    }
+
+                    Assert.IsFalse(mq.TryTakeMessage(out _));
+                    await binding.DisposeAsync();
+                });
+            }
+
+            for (int i = 0; i < messageCount; i++)
+            {
+                for (int j = 0; j < queueCount; j++)
+                {
+                    await router.PublishMessageAsync($"queue[{j}]", i); 
+                }
+            }
+
+            await Task.WhenAll(queueTask);
+        }
     }
 }
