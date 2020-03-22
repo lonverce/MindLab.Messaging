@@ -21,20 +21,14 @@ namespace MindLab.Messaging
     public sealed class UnicastMessageRouter<TMessage> : IMessageRouter<TMessage>, 
         IMessagePublisher<TMessage>, ICallbackDisposable<TMessage>
     {
-        private class HandlerComparer : IComparer<AsyncMessageHandler<TMessage>>
-        {
-            public int Compare(AsyncMessageHandler<TMessage> x, AsyncMessageHandler<TMessage> y)
-            {
-                var xCode = x?.GetHashCode() ?? 0;
-                var yCode = y?.GetHashCode() ?? 0;
-                
-                return xCode - yCode;
-            }
-        }
-
         #region Fields
 
-        private readonly IComparer<AsyncMessageHandler<TMessage>> m_handlerComparer = new HandlerComparer();
+        private readonly IEqualityComparer<AsyncMessageHandler<TMessage>> m_handlerComparer 
+            = EqualityComparer<AsyncMessageHandler<TMessage>>.Default;
+
+        private readonly IHashCodeGenerator<AsyncMessageHandler<TMessage>> m_hashCodeGenerator
+            = DelegateHashCodeGenerator<AsyncMessageHandler<TMessage>>.Default;
+
         private readonly AsyncReaderWriterLock m_lock = new AsyncReaderWriterLock();
         private readonly ConcurrentDictionary<string, SortedListSlim<AsyncMessageHandler<TMessage>>> m_subscribers 
             = new ConcurrentDictionary<string, SortedListSlim<AsyncMessageHandler<TMessage>>>(StringComparer.CurrentCultureIgnoreCase);
@@ -119,7 +113,10 @@ namespace MindLab.Messaging
             using (await m_lock.WaitForReadAsync(cancellation))
             {
                 m_subscribers.AddOrUpdate(registration.RegisterKey, 
-                    key => new SortedListSlim<AsyncMessageHandler<TMessage>>(registration.Handler, m_handlerComparer), 
+                    key => new SortedListSlim<AsyncMessageHandler<TMessage>>(
+                        registration.Handler, 
+                        m_handlerComparer,
+                        m_hashCodeGenerator), 
                     (key, sortedList) =>
                     {
                         if (sortedList.TryAppend(registration.Handler, out var newList))
@@ -151,7 +148,8 @@ namespace MindLab.Messaging
             using (await m_lock.WaitForReadAsync())
             {
                 m_subscribers.AddOrUpdate(registration.RegisterKey,
-                    key => new SortedListSlim<AsyncMessageHandler<TMessage>>(m_handlerComparer),
+                    key => new SortedListSlim<AsyncMessageHandler<TMessage>>(
+                        m_handlerComparer, m_hashCodeGenerator),
                     (key, sortedList) =>
                     {
                         if (!sortedList.TryRemove(registration.Handler, out var newList))
