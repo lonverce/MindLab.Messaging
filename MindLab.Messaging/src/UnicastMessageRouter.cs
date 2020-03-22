@@ -1,6 +1,11 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+#if DEBUG
+using System.Diagnostics.Contracts; 
+#endif
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using MindLab.Threading;
@@ -16,11 +21,23 @@ namespace MindLab.Messaging
     public sealed class UnicastMessageRouter<TMessage> : IMessageRouter<TMessage>, 
         IMessagePublisher<TMessage>, ICallbackDisposable<TMessage>
     {
+        private class HandlerComparer : IComparer<AsyncMessageHandler<TMessage>>
+        {
+            public int Compare(AsyncMessageHandler<TMessage> x, AsyncMessageHandler<TMessage> y)
+            {
+                var xCode = x?.GetHashCode() ?? 0;
+                var yCode = y?.GetHashCode() ?? 0;
+                
+                return xCode - yCode;
+            }
+        }
+
         #region Fields
-        
-        private readonly IAsyncLock m_lock = new MonitorLock();
-        private readonly ConcurrentDictionary<string, HashSet<Registration<TMessage>>> m_subscribers 
-            = new ConcurrentDictionary<string, HashSet<Registration<TMessage>>>(StringComparer.CurrentCultureIgnoreCase);
+
+        private readonly IComparer<AsyncMessageHandler<TMessage>> m_handlerComparer = new HandlerComparer();
+        private readonly AsyncReaderWriterLock m_lock = new AsyncReaderWriterLock();
+        private readonly ConcurrentDictionary<string, SortedListSlim<AsyncMessageHandler<TMessage>>> m_subscribers 
+            = new ConcurrentDictionary<string, SortedListSlim<AsyncMessageHandler<TMessage>>>(StringComparer.CurrentCultureIgnoreCase);
 
         #endregion
 
@@ -44,12 +61,40 @@ namespace MindLab.Messaging
                 throw new ArgumentNullException(nameof(key));
             }
             
-            if (!m_subscribers.TryGetValue(key, out var handlers))
+            if (!m_subscribers.TryGetValue(key, out var handlers) 
+                || handlers.Count == 0)
             {
                 return MessagePublishResult.None;
             }
 
-            return await handlers.InvokeHandlersDirectly(this, key, message);
+            var result = new MessagePublishResult
+            {
+                ReceiverCount = (uint)handlers.Count
+            };
+            var bindings = new[] { key };
+
+            try
+            {
+                var subscribers = handlers
+                    .Select(func =>
+                    {
+                        var msgArgs = new MessageArgs<TMessage>(
+                            this, key,
+                            new ReadOnlyCollection<string>(bindings),
+                            message);
+
+                        return Task.Run(() => func(msgArgs));
+                    })
+                    .ToArray();
+
+                await Task.WhenAll(subscribers);
+            }
+            catch (Exception e)
+            {
+                result.Exception = e;
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -71,19 +116,19 @@ namespace MindLab.Messaging
 
             bool ok = true;
 
-            await using (await m_lock.LockAsync(cancellation))
+            using (await m_lock.WaitForReadAsync(cancellation))
             {
                 m_subscribers.AddOrUpdate(registration.RegisterKey, 
-                    key => new HashSet<Registration<TMessage>>(new[]{registration}),
-                    (key, registrations) =>
+                    key => new SortedListSlim<AsyncMessageHandler<TMessage>>(registration.Handler, m_handlerComparer), 
+                    (key, sortedList) =>
                     {
-                        if (!registrations.Contains(registration))
+                        if (sortedList.TryAppend(registration.Handler, out var newList))
                         {
-                            return new HashSet<Registration<TMessage>>(registrations) {registration};
+                            return newList;
                         }
 
                         ok = false;
-                        return registrations;
+                        return sortedList;
                     });
             }
 
@@ -101,27 +146,51 @@ namespace MindLab.Messaging
 
         async Task ICallbackDisposable<TMessage>.DisposeCallback(Registration<TMessage> registration)
         {
-            await using (await m_lock.LockAsync())
+            bool shouldCleanUp = true;
+
+            using (await m_lock.WaitForReadAsync())
             {
-                if (!m_subscribers.TryGetValue(registration.RegisterKey, out var existedHandlers))
+                m_subscribers.AddOrUpdate(registration.RegisterKey,
+                    key => new SortedListSlim<AsyncMessageHandler<TMessage>>(m_handlerComparer),
+                    (key, sortedList) =>
+                    {
+                        if (!sortedList.TryRemove(registration.Handler, out var newList))
+                        {
+                            shouldCleanUp = false;
+                            return sortedList;
+                        }
+
+                        shouldCleanUp = newList.Count == 0;
+                        return newList;
+
+                    });
+            }
+
+            if (!shouldCleanUp)
+            {
+                return;
+            }
+
+            using (await m_lock.WaitForWriteAsync())
+            {
+                if (!m_subscribers.TryGetValue(registration.RegisterKey, out var list))
                 {
                     return;
                 }
 
-                if (!existedHandlers.Contains(registration))
+                if (list.Count > 0)
                 {
                     return;
                 }
 
-                if (existedHandlers.Count == 0)
-                {
-                    m_subscribers.TryRemove(registration.RegisterKey, out _);
-                    return;
-                }
-
-                existedHandlers = new HashSet<Registration<TMessage>>(existedHandlers);
-                existedHandlers.Remove(registration);
-                m_subscribers[registration.RegisterKey] = existedHandlers;
+#if DEBUG
+                var ok =
+#endif
+                    m_subscribers.TryRemove(registration.RegisterKey, out list);
+#if DEBUG
+                Contract.Assert(ok);
+                Contract.Assert(list.Count == 0);
+#endif
             }
         }
 

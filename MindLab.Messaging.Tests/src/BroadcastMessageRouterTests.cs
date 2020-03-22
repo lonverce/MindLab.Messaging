@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using MindLab.Threading;
 using NUnit.Framework;
 using Telerik.JustMock;
 
@@ -268,6 +269,7 @@ namespace MindLab.Messaging.Tests
         [TestCase(1,1)]
         [TestCase(1, 10)]
         [TestCase(10, 1)]
+        [TestCase(4, 1)]
         [TestCase(10, 10)]
         [TestCase(100, 100)]
         public async Task PublishMessage_AllQueueReceived(int queueCount, int messageCount)
@@ -290,6 +292,7 @@ namespace MindLab.Messaging.Tests
 
                     Assert.IsFalse(mq.TryTakeMessage(out _));
                     await binding.DisposeAsync();
+                    Assert.IsFalse(mq.TryTakeMessage(out _));
                 });
             }
 
@@ -299,6 +302,29 @@ namespace MindLab.Messaging.Tests
             }
 
             await Task.WhenAll(queueTask);
+        }
+        [Test]
+        public async Task MultiThreadTest()
+        {
+            List<Task> tasks = new List<Task>();
+            var locker = new AsyncReaderWriterLock();
+
+            for (int i = 0; i < 4; ++i)
+            {
+                tasks.Add(Task.Run(async () =>
+                {
+                    using (await locker.WaitForReadAsync())
+                    {
+                        await Task.Delay(5);
+                    }
+                    using (await locker.WaitForWriteAsync())
+                    {
+                        await Task.Delay(5);
+                    }
+                }));
+            }
+
+            await Task.WhenAll(tasks.ToArray());
         }
     }
 }
