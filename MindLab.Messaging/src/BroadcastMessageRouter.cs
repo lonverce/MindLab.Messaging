@@ -1,5 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Diagnostics.Contracts;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,9 +15,9 @@ namespace MindLab.Messaging
     public class BroadcastMessageRouter<TMessage> : IMessageRouter<TMessage>,
         IMessagePublisher<TMessage>, ICallbackDisposable<TMessage>
     {
-        private volatile HashSet<Registration<TMessage>> m_handlers = new HashSet<Registration<TMessage>>(
-            EqualityComparer<Registration<TMessage>>.Default);
-        private readonly IAsyncLock m_lock = new MonitorLock();
+        private volatile ConcurrentDictionary<AsyncMessageHandler<TMessage>, SortedListSlim<string>> m_handlers = 
+            new ConcurrentDictionary<AsyncMessageHandler<TMessage>, SortedListSlim<string>>();
+        private readonly AsyncReaderWriterLock m_lock = new AsyncReaderWriterLock();
 
         /// <summary>
         /// 订阅注册回调
@@ -28,21 +29,37 @@ namespace MindLab.Messaging
         ///     <paramref name="registration"/>为空
         /// </exception>
         public async Task<IAsyncDisposable> RegisterCallbackAsync(
-            Registration<TMessage> registration, CancellationToken cancellation = default)
+            Registration<TMessage> registration, 
+            CancellationToken cancellation = default)
         {
             if (registration == null)
             {
                 throw new ArgumentNullException(nameof(registration));
             }
 
-            await using (await m_lock.LockAsync(cancellation))
+            using (await m_lock.WaitForReadAsync(cancellation))
             {
-                if (m_handlers.Contains(registration))
+                var addOk = true;
+
+                m_handlers.AddOrUpdate(registration.Handler,
+                    handler => new SortedListSlim<string>(registration.RegisterKey,
+                        StringComparer.CurrentCultureIgnoreCase),
+                    (handler, sortedList) =>
+                    {
+                        if (sortedList.TryAppend(registration.RegisterKey, out var nextList))
+                        {
+                            return nextList;
+                        }
+
+                        addOk = false;
+                        return sortedList;
+                    });
+
+                if (!addOk)
                 {
                     throw new InvalidOperationException("Don't register again !");
                 }
 
-                m_handlers = new HashSet<Registration<TMessage>>(m_handlers.Append(registration));
                 return new CallbackDisposer<TMessage>(this, registration);
             }
         }
@@ -64,29 +81,87 @@ namespace MindLab.Messaging
                 throw new ArgumentNullException(nameof(key));
             }
 
-            var handlers = m_handlers;
+            var handlers = m_handlers
+                .ToArray();
 
-            if (handlers.Count == 0)
+            if (handlers.Length == 0)
             {
                 return MessagePublishResult.None;
             }
 
-            return await handlers.InvokeHandlers(this, key, message);
+            var result = new MessagePublishResult();
+
+            try
+            {
+                var subscribers = handlers
+                    .Where(pair => pair.Value.Count > 0)
+                    .Select(pair =>
+                    {
+                        var msgArgs = new MessageArgs<TMessage>(
+                            this, key,
+                            pair.Value,
+                            message);
+
+                        return Task.Run(() => pair.Key(msgArgs));
+                    })
+                    .ToArray();
+
+                result.ReceiverCount = (uint)subscribers.Length;
+                await Task.WhenAll(subscribers);
+            }
+            catch (Exception e)
+            {
+                result.Exception = e;
+            }
+
+            return result;
         }
 
         async Task ICallbackDisposable<TMessage>.DisposeCallback(Registration<TMessage> registration)
         {
-            await using (await m_lock.LockAsync())
+            var shouldCleanUp = true;
+            using (await m_lock.WaitForReadAsync())
             {
-                var handlers = m_handlers;
-                if (!handlers.Contains(registration))
+                m_handlers.AddOrUpdate(registration.Handler,
+                    handler => new SortedListSlim<string>(StringComparer.CurrentCultureIgnoreCase),
+                    (handler, slim) =>
+                    {
+                        if (!slim.TryRemove(registration.RegisterKey, out var newList))
+                        {
+                            shouldCleanUp = false;
+                            return slim;
+                        }
+
+                        shouldCleanUp = newList.Count == 0;
+                        return newList;
+                    });
+            }
+
+            if (!shouldCleanUp)
+            {
+                return;
+            }
+
+            using (await m_lock.WaitForWriteAsync())
+            {
+                if (!m_handlers.TryGetValue(registration.Handler, out var list))
                 {
                     return;
                 }
 
-                handlers = new HashSet<Registration<TMessage>>(m_handlers);
-                handlers.Remove(registration);
-                m_handlers = handlers;
+                if (list.Count > 0)
+                {
+                    return;
+                }
+
+#if DEBUG
+                var ok =  
+#endif
+                m_handlers.TryRemove(registration.Handler, out list);
+#if DEBUG
+                Contract.Assert(ok);
+                Contract.Assert(list.Count == 0);
+#endif
             }
         }
     }
