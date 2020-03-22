@@ -20,6 +20,17 @@ namespace MindLab.Messaging
         private volatile ConcurrentDictionary<AsyncMessageHandler<TMessage>, SortedListSlim<string>> m_handlers = 
             new ConcurrentDictionary<AsyncMessageHandler<TMessage>, SortedListSlim<string>>();
         private readonly AsyncReaderWriterLock m_lock = new AsyncReaderWriterLock();
+        private readonly StringComparer m_keyStringComparer;
+        private readonly StringHashCodeGenerator m_keyCodeGenerator;
+
+        /// <summary>
+        /// 广播式消息路由器
+        /// </summary>
+        public BroadcastMessageRouter()
+        {
+            m_keyStringComparer = StringComparer.CurrentCultureIgnoreCase;
+            m_keyCodeGenerator = new StringHashCodeGenerator(m_keyStringComparer);
+        }
 
         /// <summary>
         /// 订阅注册回调
@@ -45,7 +56,8 @@ namespace MindLab.Messaging
 
                 m_handlers.AddOrUpdate(registration.Handler,
                     handler => new SortedListSlim<string>(registration.RegisterKey,
-                        StringComparer.CurrentCultureIgnoreCase),
+                        m_keyStringComparer,
+                        m_keyCodeGenerator),
                     (handler, sortedList) =>
                     {
                         if (sortedList.TryAppend(registration.RegisterKey, out var nextList))
@@ -125,7 +137,7 @@ namespace MindLab.Messaging
             using (await m_lock.WaitForReadAsync())
             {
                 m_handlers.AddOrUpdate(registration.Handler,
-                    handler => new SortedListSlim<string>(StringComparer.CurrentCultureIgnoreCase),
+                    handler => new SortedListSlim<string>(m_keyStringComparer, m_keyCodeGenerator),
                     (handler, slim) =>
                     {
                         if (!slim.TryRemove(registration.RegisterKey, out var newList))
