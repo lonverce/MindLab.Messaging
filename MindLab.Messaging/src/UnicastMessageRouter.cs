@@ -21,6 +21,17 @@ namespace MindLab.Messaging
     public sealed class UnicastMessageRouter<TMessage> : IMessageRouter<TMessage>, 
         IMessagePublisher<TMessage>, ICallbackDisposable<TMessage>
     {
+        private class HandlerComparer : IComparer<AsyncMessageHandler<TMessage>>
+        {
+            public int Compare(AsyncMessageHandler<TMessage> x, AsyncMessageHandler<TMessage> y)
+            {
+                var xCode = x?.GetHashCode() ?? 0;
+                var yCode = y?.GetHashCode() ?? 0;
+                
+                return xCode - yCode;
+            }
+        }
+
         #region Fields
 
         private readonly IEqualityComparer<AsyncMessageHandler<TMessage>> m_handlerComparer 
