@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Diagnostics.Contracts;
+#if DEBUG
+using System.Diagnostics.Contracts; 
+#endif
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
